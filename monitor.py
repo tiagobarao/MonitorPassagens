@@ -19,9 +19,14 @@ from apscheduler.schedulers.background import BackgroundScheduler
 _CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 
 def _carregar_config():
+    # Permite passar o config como variável de ambiente (ex: deploy no Fly.io)
+    config_env = os.getenv("CONFIG_JSON")
+    if config_env:
+        return json.loads(config_env)
     if not os.path.exists(_CONFIG_PATH):
         raise FileNotFoundError(
-            f"Arquivo de configuração não encontrado: {_CONFIG_PATH}"
+            f"Arquivo de configuração não encontrado: {_CONFIG_PATH}\n"
+            "Defina a variável de ambiente CONFIG_JSON ou crie o arquivo config.json."
         )
     with open(_CONFIG_PATH, encoding="utf-8") as f:
         return json.load(f)
