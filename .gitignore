@@ -1,0 +1,5 @@
+config.json
+passagens.db
+monitor.log
+__pycache__/
+*.pyc

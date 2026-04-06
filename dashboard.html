@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Monitor de Passagens Aéreas</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/sql-wasm.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      min-height: 100vh;
+    }
+
+    header {
+      background: linear-gradient(135deg, #1e3a5f, #0f172a);
+      padding: 1.5rem 2rem;
+      border-bottom: 1px solid #1e40af44;
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+    header h1 { font-size: 1.5rem; font-weight: 700; color: #93c5fd; }
+    header span { font-size: 1.8rem; }
+
+    .toolbar {
+      padding: 1rem 2rem;
+      display: flex;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+      background: #0f172a;
+      border-bottom: 1px solid #1e293b;
+    }
+
+    button {
+      padding: 0.5rem 1.2rem;
+      border-radius: 8px;
+      border: none;
+      font-size: 0.875rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.15s;
+    }
+    button:hover { opacity: 0.85; }
+    .btn-primary  { background: #2563eb; color: #fff; }
+    .btn-secondary { background: #334155; color: #cbd5e1; }
+
+    #status {
+      padding: 0.5rem 2rem;
+      font-size: 0.8rem;
+      color: #64748b;
+      min-height: 1.8rem;
+    }
+
+    main { padding: 1.5rem 2rem; display: flex; flex-direction: column; gap: 2rem; }
+
+    /* ---- cards resumo ---- */
+    .cards { display: flex; flex-wrap: wrap; gap: 1rem; }
+
+    .card {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 1.2rem 1.5rem;
+      flex: 1 1 220px;
+      display: flex;
+      flex-direction: column;
+      gap: 0.3rem;
+    }
+    .card .route  { font-size: 1rem; font-weight: 700; color: #93c5fd; }
+    .card .price  { font-size: 1.8rem; font-weight: 800; color: #34d399; }
+    .card .detail { font-size: 0.8rem; color: #94a3b8; }
+
+    /* ---- seções ---- */
+    section { display: flex; flex-direction: column; gap: 1rem; }
+    section h2 { font-size: 1.1rem; font-weight: 600; color: #93c5fd; }
+
+    /* ---- gráfico ---- */
+    .chart-wrapper {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 1.2rem;
+      position: relative;
+    }
+    .chart-filters { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.8rem; }
+    .chip {
+      padding: 0.25rem 0.75rem;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      background: #334155;
+      color: #cbd5e1;
+      cursor: pointer;
+      border: 2px solid transparent;
+      transition: border-color 0.15s;
+    }
+    .chip.active { border-color: #2563eb; color: #93c5fd; }
+
+    /* ---- tabela ---- */
+    .table-wrap { overflow-x: auto; border-radius: 12px; border: 1px solid #334155; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+    thead { background: #0f172a; }
+    th {
+      padding: 0.75rem 1rem;
+      text-align: left;
+      font-weight: 600;
+      color: #64748b;
+      text-transform: uppercase;
+      font-size: 0.7rem;
+      letter-spacing: 0.05em;
+    }
+    td { padding: 0.65rem 1rem; border-top: 1px solid #1e293b; }
+    tr:hover td { background: #1e293b55; }
+
+    .badge {
+      display: inline-block;
+      padding: 0.15rem 0.55rem;
+      border-radius: 999px;
+      font-size: 0.7rem;
+      font-weight: 700;
+    }
+    .badge-real     { background: #065f4633; color: #34d399; }
+    .badge-estimado { background: #1e3a5f55; color: #93c5fd; }
+
+    .delta-pos { color: #f87171; }
+    .delta-neg { color: #34d399; }
+
+    #empty-state {
+      text-align: center;
+      padding: 4rem 2rem;
+      color: #475569;
+      display: none;
+    }
+    #empty-state p { margin-top: 0.5rem; font-size: 0.9rem; }
+  </style>
+</head>
+<body>
+
+<header>
+  <span>✈️</span>
+  <h1>Monitor de Passagens Aéreas</h1>
+</header>
+
+<div class="toolbar">
+  <button class="btn-primary" onclick="abrirArquivo()">📂 Carregar banco (.db)</button>
+  <button class="btn-secondary" onclick="carregarExemplo()">🧪 Ver dados de exemplo</button>
+  <input type="file" id="fileInput" accept=".db" style="display:none" onchange="lerArquivo(event)" />
+</div>
+
+<div id="status">Nenhum banco carregado.</div>
+
+<main id="main" style="display:none">
+
+  <section>
+    <h2>Menor preço por rota</h2>
+    <div class="cards" id="cards"></div>
+  </section>
+
+  <section>
+    <h2>Evolução de preços</h2>
+    <div class="chart-wrapper">
+      <div class="chart-filters" id="chipContainer"></div>
+      <canvas id="grafico" height="110"></canvas>
+    </div>
+  </section>
+
+  <section>
+    <h2>Melhores datas</h2>
+    <div class="table-wrap">
+      <table id="tabela">
+        <thead>
+          <tr>
+            <th>Rota</th>
+            <th>Data partida</th>
+            <th>Preço USD</th>
+            <th>Tipo</th>
+            <th>Variação</th>
+            <th>Capturado em</th>
+          </tr>
+        </thead>
+        <tbody id="tabBody"></tbody>
+      </table>
+    </div>
+  </section>
+
+</main>
+
+<div id="empty-state">
+  <p style="font-size:2rem">🗂️</p>
+  <p>Nenhum dado encontrado no banco selecionado.</p>
+</div>
+
+<script>
+/* ------------------------------------------------------------------ */
+/*  sql.js bootstrap                                                    */
+/* ------------------------------------------------------------------ */
+let SQL;
+initSqlJs({ locateFile: f => `https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/${f}` })
+  .then(s => { SQL = s; setStatus("sql.js carregado. Selecione um banco de dados."); })
+  .catch(e => setStatus("Erro ao carregar sql.js: " + e));
+
+let grafico = null;
+let todasLinhas = [];
+let rotas = [];
+
+/* ------------------------------------------------------------------ */
+/*  UI helpers                                                          */
+/* ------------------------------------------------------------------ */
+function setStatus(msg) { document.getElementById("status").textContent = msg; }
+
+function abrirArquivo() { document.getElementById("fileInput").click(); }
+
+function lerArquivo(evt) {
+  const file = evt.target.files[0];
+  if (!file) return;
+  setStatus("Lendo " + file.name + "…");
+  const reader = new FileReader();
+  reader.onload = e => processar(new Uint8Array(e.target.result), file.name);
+  reader.readAsArrayBuffer(file);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Processar banco                                                     */
+/* ------------------------------------------------------------------ */
+function processar(buffer, nome) {
+  if (!SQL) { setStatus("sql.js ainda não carregado. Tente novamente."); return; }
+  try {
+    const db = new SQL.Database(buffer);
+    const rows = db.exec("SELECT * FROM precos ORDER BY capturado_em DESC");
+    if (!rows.length || !rows[0].values.length) {
+      document.getElementById("main").style.display = "none";
+      document.getElementById("empty-state").style.display = "block";
+      setStatus("Banco carregado: " + nome + " — sem registros.");
+      db.close();
+      return;
+    }
+    document.getElementById("empty-state").style.display = "none";
+    document.getElementById("main").style.display = "flex";
+
+    const cols = rows[0].columns;  // id, capturado_em, origem, destino, data_partida, preco_usd, tipo
+    todasLinhas = rows[0].values.map(v => Object.fromEntries(cols.map((c, i) => [c, v[i]])));
+    rotas = [...new Set(todasLinhas.map(r => r.origem + "→" + r.destino))];
+
+    renderCards();
+    renderChips();
+    renderGrafico(rotas);
+    renderTabela();
+    setStatus(`Banco carregado: ${nome}  |  ${todasLinhas.length} registros  |  ${rotas.length} rota(s)`);
+    db.close();
+  } catch(e) {
+    setStatus("Erro ao ler banco: " + e.message);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Cards                                                               */
+/* ------------------------------------------------------------------ */
+function renderCards() {
+  const container = document.getElementById("cards");
+  container.innerHTML = "";
+
+  rotas.forEach(rota => {
+    const [orig, dest] = rota.split("→");
+    const reais = todasLinhas.filter(r => r.origem === orig && r.destino === dest && r.tipo === "real");
+    const todos  = todasLinhas.filter(r => r.origem === orig && r.destino === dest);
+    const fonte  = reais.length ? reais : todos;
+    const melhor = fonte.reduce((a, b) => +a.preco_usd < +b.preco_usd ? a : b);
+
+    container.innerHTML += `
+      <div class="card">
+        <div class="route">${orig} → ${dest}</div>
+        <div class="price">USD ${(+melhor.preco_usd).toFixed(2)}</div>
+        <div class="detail">Data: ${melhor.data_partida}</div>
+        <div class="detail">Tipo: ${melhor.tipo} · ${melhor.capturado_em.slice(0,16)}</div>
+      </div>`;
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/*  Chips de filtro do gráfico                                          */
+/* ------------------------------------------------------------------ */
+let rotasAtivas = new Set();
+
+function renderChips() {
+  const cont = document.getElementById("chipContainer");
+  cont.innerHTML = "";
+  rotasAtivas = new Set(rotas);
+
+  rotas.forEach(rota => {
+    const chip = document.createElement("span");
+    chip.className = "chip active";
+    chip.textContent = rota;
+    chip.dataset.rota = rota;
+    chip.onclick = () => {
+      if (rotasAtivas.has(rota)) rotasAtivas.delete(rota);
+      else rotasAtivas.add(rota);
+      chip.classList.toggle("active");
+      renderGrafico([...rotasAtivas]);
+    };
+    cont.appendChild(chip);
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/*  Gráfico                                                             */
+/* ------------------------------------------------------------------ */
+const CORES = ["#3b82f6","#10b981","#f59e0b","#ef4444","#a78bfa","#f472b6"];
+
+function renderGrafico(rotasFiltradas) {
+  const ctx = document.getElementById("grafico").getContext("2d");
+  if (grafico) grafico.destroy();
+
+  const datasets = rotasFiltradas.map((rota, i) => {
+    const [orig, dest] = rota.split("→");
+    const pontos = todasLinhas
+      .filter(r => r.origem === orig && r.destino === dest)
+      .map(r => ({ x: r.capturado_em.slice(0,16), y: +r.preco_usd }))
+      .sort((a, b) => a.x.localeCompare(b.x));
+
+    return {
+      label: rota,
+      data: pontos,
+      borderColor: CORES[i % CORES.length],
+      backgroundColor: CORES[i % CORES.length] + "22",
+      tension: 0.3,
+      pointRadius: 4,
+      fill: false,
+    };
+  });
+
+  grafico = new Chart(ctx, {
+    type: "line",
+    data: { datasets },
+    options: {
+      parsing: { xAxisKey: "x", yAxisKey: "y" },
+      responsive: true,
+      plugins: {
+        legend: { labels: { color: "#94a3b8" } },
+        tooltip: {
+          callbacks: {
+            label: ctx => ` USD ${ctx.parsed.y.toFixed(2)}`
+          }
+        }
+      },
+      scales: {
+        x: {
+          ticks: { color: "#64748b", maxTicksLimit: 10 },
+          grid: { color: "#1e293b" },
+        },
+        y: {
+          ticks: { color: "#64748b", callback: v => "USD " + v },
+          grid: { color: "#1e293b" },
+        },
+      },
+    },
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/*  Tabela                                                              */
+/* ------------------------------------------------------------------ */
+function renderTabela() {
+  const tbody = document.getElementById("tabBody");
+  tbody.innerHTML = "";
+
+  // Para cada linha calcular variação em relação ao preço anterior da mesma rota+data
+  const chave = r => r.origem + "|" + r.destino + "|" + r.data_partida;
+  const hist = {};
+  [...todasLinhas].reverse().forEach(r => {
+    const k = chave(r);
+    r._prev = hist[k];
+    hist[k] = +r.preco_usd;
+  });
+
+  // Ordena por preço asc
+  const sorted = [...todasLinhas].sort((a,b) => +a.preco_usd - +b.preco_usd);
+
+  sorted.forEach(r => {
+    const delta = r._prev != null ? +r.preco_usd - r._prev : null;
+    const deltaHtml = delta == null
+      ? "—"
+      : delta > 0
+        ? `<span class="delta-pos">▲ ${delta.toFixed(2)}</span>`
+        : delta < 0
+          ? `<span class="delta-neg">▼ ${Math.abs(delta).toFixed(2)}</span>`
+          : "=";
+
+    const badge = r.tipo === "real"
+      ? `<span class="badge badge-real">real</span>`
+      : `<span class="badge badge-estimado">estimado</span>`;
+
+    tbody.innerHTML += `
+      <tr>
+        <td>${r.origem} → ${r.destino}</td>
+        <td>${r.data_partida}</td>
+        <td><strong>USD ${(+r.preco_usd).toFixed(2)}</strong></td>
+        <td>${badge}</td>
+        <td>${deltaHtml}</td>
+        <td>${r.capturado_em.slice(0,16)}</td>
+      </tr>`;
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/*  Dados de exemplo                                                    */
+/* ------------------------------------------------------------------ */
+function carregarExemplo() {
+  const hoje = new Date();
+  const fmt = d => d.toISOString().slice(0,19);
+  const fmtDate = (d, addDays) => {
+    const nd = new Date(d); nd.setDate(nd.getDate() + addDays);
+    return nd.toISOString().slice(0,10);
+  };
+
+  todasLinhas = [];
+  const baseDatas = [30,45,60,75,90];
+  const rotasEx = [
+    { origem:"GRU", destino:"LIS", base:2800 },
+    { origem:"GRU", destino:"MIA", base:1100 },
+  ];
+  let id = 1;
+
+  rotasEx.forEach(rota => {
+    baseDatas.forEach(dias => {
+      const dataPart = fmtDate(hoje, dias);
+      // 3 capturas estimadas
+      for (let h = 0; h < 3; h++) {
+        const cap = new Date(hoje); cap.setHours(cap.getHours() - (3-h)*24);
+        const preco = rota.base + Math.round((Math.random()-0.5)*400);
+        todasLinhas.push({ id: id++, capturado_em: fmt(cap), origem: rota.origem,
+          destino: rota.destino, data_partida: dataPart, preco_usd: preco, tipo:"estimado" });
+      }
+      // 2 capturas reais (horário)
+      for (let h = 0; h < 2; h++) {
+        const cap = new Date(hoje); cap.setHours(cap.getHours() - h*2);
+        const preco = rota.base + Math.round((Math.random()-0.5)*200);
+        todasLinhas.push({ id: id++, capturado_em: fmt(cap), origem: rota.origem,
+          destino: rota.destino, data_partida: dataPart, preco_usd: preco, tipo:"real" });
+      }
+    });
+  });
+
+  rotas = [...new Set(todasLinhas.map(r => r.origem + "→" + r.destino))];
+  document.getElementById("empty-state").style.display = "none";
+  document.getElementById("main").style.display = "flex";
+
+  renderCards();
+  renderChips();
+  renderGrafico(rotas);
+  renderTabela();
+  setStatus(`Dados de exemplo carregados — ${todasLinhas.length} registros simulados.`);
+}
+</script>
+</body>
+</html>
