@@ -1,6 +1,6 @@
 """
 Monitor de Preços de Passagens Aéreas
-Usa a API Aviasales/TravelPayouts + alertas via Telegram.
+Usa a SerpAPI (Google Flights) + alertas via Telegram.
 """
 
 import json
@@ -9,6 +9,7 @@ import sqlite3
 import logging
 import time
 import requests
+import serpapi
 from datetime import datetime, date, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -33,30 +34,19 @@ def _carregar_config():
 
 _cfg = _carregar_config()
 
-AVIASALES_TOKEN    = _cfg["aviasales_token"]
+SERPAPI_KEY        = _cfg["serpapi_key"]
 TELEGRAM_BOT_TOKEN = _cfg.get("telegram_bot_token", "")
 TELEGRAM_CHAT_ID   = _cfg.get("telegram_chat_id",   "")
 
-DB_PATH        = _cfg.get("db_path",        "passagens.db")
-LOG_PATH       = _cfg.get("log_path",        "monitor.log")
-TOP_DATAS      = _cfg.get("top_datas",       5)
-SCAN_HORIZONTE = _cfg.get("scan_horizonte",  4)   # meses à frente
-PAUSA_CHAMADAS = _cfg.get("pausa_chamadas",  2)   # segundos entre chamadas
+DB_PATH        = _cfg.get("db_path",       "passagens.db")
+LOG_PATH       = _cfg.get("log_path",      "monitor.log")
+TOP_DATAS      = _cfg.get("top_datas",     5)
+SCAN_HORIZONTE = _cfg.get("scan_horizonte", 4)   # meses à frente
 
 ROTAS = _cfg["rotas"]
 
-# Mapa de códigos IATA de companhias aéreas comuns
-_AIRLINES = {
-    "JL": "Japan Airlines", "NH": "ANA", "LA": "LATAM", "G3": "GOL",
-    "AD": "Azul",           "AA": "American Airlines", "UA": "United",
-    "DL": "Delta",          "AF": "Air France", "KL": "KLM",
-    "IB": "Iberia",         "TP": "TAP",        "LH": "Lufthansa",
-    "BA": "British Airways","EK": "Emirates",   "QR": "Qatar Airways",
-    "TK": "Turkish Airlines","CX": "Cathay Pacific","SQ": "Singapore Airlines",
-}
-
-def _nome_companhia(codigo: str) -> str:
-    return _AIRLINES.get(codigo.upper(), codigo.upper()) if codigo else "—"
+# SerpAPI: travel_class values
+_CABINE_MAP = {"economy": 1, "premium_economy": 2, "business": 3, "first": 4}
 
 # ---------------------------------------------------------------------------
 # LOGGING
@@ -78,6 +68,11 @@ log = logging.getLogger(__name__)
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
+    # Detecta schema antigo (coluna preco_usd) e recria a tabela
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(precos)")}
+    if cols and "preco_usd" in cols:
+        log.warning("Schema antigo detectado (preco_usd). Recriando tabela precos…")
+        conn.execute("DROP TABLE precos")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS precos (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,49 +80,26 @@ def init_db():
             origem       TEXT NOT NULL,
             destino      TEXT NOT NULL,
             data_partida TEXT NOT NULL,
-            preco_usd    REAL NOT NULL,
+            preco_brl    REAL NOT NULL,
             companhia    TEXT NOT NULL DEFAULT '',
-            tipo         TEXT NOT NULL
+            paradas      INTEGER NOT NULL DEFAULT 0
         )
     """)
-    try:
-        conn.execute("ALTER TABLE precos ADD COLUMN companhia TEXT NOT NULL DEFAULT ''")
-    except sqlite3.OperationalError:
-        pass
     conn.commit()
     conn.close()
     log.info("Banco de dados inicializado: %s", DB_PATH)
 
 
-def salvar_preco(origem, destino, data_partida, preco_usd, companhia, tipo):
+def salvar_preco(origem, destino, data_partida, preco_brl, companhia, paradas):
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
-        "INSERT INTO precos (capturado_em, origem, destino, data_partida, preco_usd, companhia, tipo) "
+        "INSERT INTO precos (capturado_em, origem, destino, data_partida, preco_brl, companhia, paradas) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (datetime.now().isoformat(timespec="seconds"), origem, destino,
-         data_partida, preco_usd, companhia, tipo),
+         data_partida, preco_brl, companhia, paradas),
     )
     conn.commit()
     conn.close()
-
-
-def listar_datas_monitoradas():
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("""
-        SELECT DISTINCT origem, destino, data_partida
-        FROM (
-            SELECT origem, destino, data_partida, preco_usd,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY origem, destino
-                       ORDER BY preco_usd ASC
-                   ) AS rn
-            FROM precos
-            WHERE tipo = 'estimado'
-        )
-        WHERE rn <= ?
-    """, (TOP_DATAS,)).fetchall()
-    conn.close()
-    return rows
 
 # ---------------------------------------------------------------------------
 # TELEGRAM
@@ -145,218 +117,213 @@ def enviar_telegram(mensagem: str):
         }, timeout=10)
         resp.raise_for_status()
         log.info("Mensagem Telegram enviada.")
-    except Exception as exc:
+    except BaseException as exc:
         log.warning("Falha ao enviar Telegram: %s", exc)
 
 # ---------------------------------------------------------------------------
-# AVIASALES — helpers
+# SERPAPI — Google Flights
 # ---------------------------------------------------------------------------
 
-_BASE_URL  = "https://api.travelpayouts.com"
-_CABINE_MAP = {"economy": 0, "premium_economy": 0, "business": 1, "first": 2}
+def _sabados_do_mes(primeiro_dia: date) -> list[date]:
+    """Retorna os 4 primeiros sábados do mês."""
+    sabados = []
+    d = primeiro_dia
+    while d.weekday() != 5:   # 5 = sábado
+        d += timedelta(days=1)
+    for _ in range(4):
+        if d.month == primeiro_dia.month:
+            sabados.append(d)
+        d += timedelta(days=7)
+    return sabados
 
 
-def _headers():
-    return {"X-Access-Token": AVIASALES_TOKEN}
-
-
-def _chamar_api(endpoint: str, params: dict) -> dict | None:
-    """Faz uma chamada GET à API, trata 429. Retorna JSON ou None."""
-    url = _BASE_URL + endpoint
-    for tentativa in range(3):
-        try:
-            resp = requests.get(url, params=params, headers=_headers(), timeout=15)
-            if resp.status_code == 429:
-                espera = int(resp.headers.get("Retry-After", 60))
-                log.warning("429 — aguardando %ds… (tentativa %d/3)", espera, tentativa + 1)
-                time.sleep(espera)
-                continue
-            resp.raise_for_status()
-            return resp.json()
-        except requests.RequestException as exc:
-            log.error("Erro HTTP Aviasales (%s): %s", endpoint, exc)
-            return None
-    return None
-
-
-def _buscar_calendario(origem: str, destino: str, mes: str,
-                       trip_class: int = 0, somente_direto: bool = False,
-                       ida_e_volta: bool = True, dias_retorno: int = 7) -> list[dict]:
+def _buscar_economy_mes(origem: str, destino: str, mes_inicio: date, mes_fim: date,
+                        ida_e_volta: bool = True) -> list[dict]:
     """
-    Busca preços para todos os dias de um mês.
-    mes = 'YYYY-MM'
-    Retorna lista de {"data", "preco", "companhia"} ordenada por preço.
+    Economy: usa google_travel_explore (1 chamada por mês).
+    Retorna lista de {"mes", "preco_brl", "companhia", "paradas", "link"}.
     """
     params = {
-        "origin":      origem,
-        "destination": destino,
-        "depart_date": mes,
-        "currency":    "usd",
-        "trip_class":  trip_class,
-        "token":       AVIASALES_TOKEN,
+        "engine":        "google_travel_explore",
+        "departure_id":  origem,
+        "arrival_id":    destino,
+        "outbound_date": mes_inicio.strftime("%Y-%m-%d"),
+        "return_date":   mes_fim.strftime("%Y-%m-%d"),
+        "travel_class":  1,
+        "currency":      "BRL",
+        "hl":            "pt-BR",
+        "api_key":       SERPAPI_KEY,
     }
-    if ida_e_volta:
-        # Calcula o mês de retorno com base nos dias_retorno
-        ano, m = int(mes[:4]), int(mes[5:7])
-        mes_retorno = date(ano, m, 1) + timedelta(days=dias_retorno + 15)
-        params["return_date"] = mes_retorno.strftime("%Y-%m")
-    else:
-        params["one_way"] = "true"
-    if somente_direto:
-        params["direct"] = "true"
-    body = _chamar_api("/v1/prices/calendar", params)
-    if not body or not body.get("success") or not body.get("data"):
+    if not ida_e_volta:
+        params["type"] = 2
+
+    try:
+        results = serpapi.search(params)
+    except Exception as exc:
+        log.error("Erro SerpAPI economy (%s→%s) %s: %s",
+                  origem, destino, mes_inicio.strftime("%Y-%m"), exc)
         return []
 
+    google_link = results.get("search_metadata", {}).get("google_travel_explore_url", "")
     resultados = []
-    for data_str, info in body["data"].items():
+    for v in results.get("flights", []):
         try:
-            preco = float(info["price"])
+            preco_brl = float(v["price"])
         except (KeyError, TypeError, ValueError):
             continue
-        # Filtra datas passadas
-        if date.fromisoformat(data_str[:10]) <= date.today():
-            continue
         resultados.append({
-            "data":       data_str[:10],
-            "preco":      preco,
-            "companhia":  _nome_companhia(info.get("airline", "")),
+            "mes":       mes_inicio.strftime("%Y-%m"),
+            "preco_brl": preco_brl,
+            "companhia": v.get("airline", "—") or "—",
+            "paradas":   int(v.get("number_of_stops", 0)),
+            "link":      google_link,
         })
 
-    resultados.sort(key=lambda x: x["preco"])
+    resultados.sort(key=lambda x: x["preco_brl"])
     return resultados
 
 
-def _buscar_preco_data(origem: str, destino: str, data_partida: str,
-                       trip_class: int = 0, somente_direto: bool = False,
-                       ida_e_volta: bool = True, dias_retorno: int = 7) -> dict | None:
+def _buscar_business_data(origem: str, destino: str, data_ida: date, travel_class: int,
+                          ida_e_volta: bool = True, dias_retorno: int = 7) -> list[dict]:
     """
-    Busca o menor preço disponível para uma data específica.
-    Retorna {"data", "preco", "companhia"} ou None.
+    Business/First: usa google_flights em uma data específica.
+    Retorna lista de {"mes", "preco_brl", "companhia", "paradas", "link"}.
     """
-    mes = data_partida[:7]   # YYYY-MM
-    resultados = _buscar_calendario(origem, destino, mes, trip_class,
-                                    somente_direto, ida_e_volta, dias_retorno)
-    # Filtra apenas a data exata
-    for r in resultados:
-        if r["data"] == data_partida:
-            return r
-    return None
+    params = {
+        "engine":        "google_flights",
+        "departure_id":  origem,
+        "arrival_id":    destino,
+        "outbound_date": data_ida.strftime("%Y-%m-%d"),
+        "travel_class":  travel_class,
+        "currency":      "BRL",
+        "hl":            "pt-BR",
+        "type":          1 if ida_e_volta else 2,
+        "api_key":       SERPAPI_KEY,
+    }
+    if ida_e_volta:
+        params["return_date"] = (data_ida + timedelta(days=dias_retorno)).strftime("%Y-%m-%d")
 
-# ---------------------------------------------------------------------------
-# VARREDURA DIÁRIA
-# ---------------------------------------------------------------------------
+    try:
+        results = serpapi.search(params)
+    except Exception as exc:
+        log.error("Erro SerpAPI business (%s→%s) %s: %s",
+                  origem, destino, data_ida, exc)
+        return []
 
-def varredura_diaria():
-    """
-    Para cada rota, consulta o calendário de preços dos próximos
-    SCAN_HORIZONTE meses e salva as TOP_DATAS datas mais baratas.
-    """
-    log.info("=== Iniciando varredura diária ===")
+    google_link = results.get("search_metadata", {}).get("google_flights_url", "")
+    voos_raw = results.get("best_flights", []) + results.get("other_flights", [])
 
-    # Gera lista de meses a consultar (ex: ["2026-04", "2026-05", ...])
-    meses = []
+    resultados = []
+    for v in voos_raw:
+        try:
+            preco_brl = float(v["price"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        flights   = v.get("flights", [{}])
+        companhia = flights[0].get("airline", "—") if flights else "—"
+        paradas   = len(v.get("layovers", []))
+        resultados.append({
+            "mes":       data_ida.strftime("%Y-%m"),
+            "preco_brl": preco_brl,
+            "companhia": companhia,
+            "paradas":   paradas,
+            "link":      google_link,
+        })
+
+    resultados.sort(key=lambda x: x["preco_brl"])
+    return resultados
+
+
+def _buscar_voos(origem: str, destino: str, travel_class: int = 1,
+                 ida_e_volta: bool = True, dias_retorno: int = 7) -> list[dict]:
+    """
+    Economy → google_travel_explore (1 chamada/mês).
+    Business/First → google_flights nos 4 sábados de cada mês.
+    Retorna lista combinada ordenada por preço.
+    """
+    hoje = date.today()
+    todos = []
+
     for i in range(SCAN_HORIZONTE):
-        d = date.today().replace(day=1) + timedelta(days=32 * i)
-        meses.append(d.strftime("%Y-%m"))
+        primeiro = (hoje.replace(day=1) + timedelta(days=32 * i)).replace(day=1)
+        mes_str  = primeiro.strftime("%Y-%m")
+
+        if travel_class == 1:   # economy
+            if primeiro.month == 12:
+                ultimo = primeiro.replace(year=primeiro.year + 1, month=1, day=1) - timedelta(days=1)
+            else:
+                ultimo = primeiro.replace(month=primeiro.month + 1, day=1) - timedelta(days=1)
+            # Garante que outbound_date não seja data passada
+            inicio_efetivo = max(primeiro, hoje + timedelta(days=1))
+            if inicio_efetivo > ultimo:
+                continue
+            log.info("  %s → %s | %s (economy)…", origem, destino, mes_str)
+            todos.extend(_buscar_economy_mes(origem, destino, inicio_efetivo, ultimo, ida_e_volta))
+        else:                   # business / first
+            for sabado in _sabados_do_mes(primeiro):
+                if sabado <= hoje:
+                    continue
+                log.info("  %s → %s | %s business…", origem, destino, sabado)
+                todos.extend(_buscar_business_data(
+                    origem, destino, sabado, travel_class, ida_e_volta=ida_e_volta,
+                    dias_retorno=dias_retorno))
+
+    todos.sort(key=lambda x: x["preco_brl"])
+    return todos
+
+# ---------------------------------------------------------------------------
+# VERIFICAÇÃO DE ROTAS (roda a cada 6h)
+# ---------------------------------------------------------------------------
+
+def verificar_rotas():
+    """Consulta todas as rotas e envia resumo via Telegram. Roda a cada 6h."""
+    log.info("=== Verificando rotas ===")
+    agora  = datetime.now().strftime("%d/%m/%Y %H:%M")
+    linhas = [f"✈️ <b>Monitor de Passagens — {agora}</b>\n"]
+    encontrou = False
 
     for rota in ROTAS:
-        origem  = rota["origem"]
-        destino = rota["destino"]
-        trip_class     = _CABINE_MAP.get(rota.get("cabine", "economy"), 0)
-        somente_direto = rota.get("somente_direto", False)
-        ida_e_volta    = rota.get("ida_e_volta", True)
-        dias_retorno   = rota.get("dias_retorno", 7)
-        log.info("Varrendo %s → %s (%d meses, cabine: %s, %s, direto: %s)",
-                 origem, destino, len(meses), rota.get("cabine", "economy"),
-                 "ida e volta" if ida_e_volta else "só ida", somente_direto)
+        origem, destino = rota["origem"], rota["destino"]
+        alerta_brl   = rota.get("alerta_preco", float("inf"))
+        travel_class = _CABINE_MAP.get(rota.get("cabine", "economy"), 1)
+        ida_e_volta  = rota.get("ida_e_volta", True)
+        log.info("  Buscando %s → %s (cabine: %s, %s)…",
+                 origem, destino, rota.get("cabine", "economy"),
+                 "ida e volta" if ida_e_volta else "só ida")
 
-        todos = []
-        for i, mes in enumerate(meses, 1):
-            log.info("  [%d/%d] %s → %s | %s…", i, len(meses), origem, destino, mes)
-            resultados = _buscar_calendario(origem, destino, mes, trip_class,
-                                            somente_direto, ida_e_volta, dias_retorno)
-            todos.extend(resultados)
-            time.sleep(PAUSA_CHAMADAS)
+        todos = _buscar_voos(origem, destino, travel_class, ida_e_volta)
 
         if not todos:
-            log.warning("  Nenhum resultado para %s → %s. "
-                        "Verifique o token e se a rota tem voos disponíveis.", origem, destino)
+            log.warning("Sem resultados para %s → %s.", origem, destino)
             continue
 
-        todos.sort(key=lambda x: x["preco"])
         top = todos[:TOP_DATAS]
-        log.info("  %d datas com preço encontradas.", len(todos))
-        for r in top:
-            salvar_preco(origem, destino, r["data"], r["preco"], r["companhia"], "estimado")
-            log.info("  %s → %s | %s | USD %.2f | %s (estimado)",
-                     origem, destino, r["data"], r["preco"], r["companhia"])
 
-    log.info("=== Varredura diária concluída ===")
-
-# ---------------------------------------------------------------------------
-# MONITORAMENTO HORÁRIO
-# ---------------------------------------------------------------------------
-
-def monitoramento_horario():
-    """Reconsulta as datas salvas e envia resumo completo via Telegram."""
-    log.info("--- Monitoramento horário ---")
-    datas = listar_datas_monitoradas()
-
-    if not datas:
-        log.warning("Nenhuma data no banco. Verifique se a varredura diária rodou com sucesso.")
-        return
-
-    alertas = {(r["origem"], r["destino"]): r["alerta_preco"] for r in ROTAS}
-    agora   = datetime.now().strftime("%d/%m/%Y %H:%M")
-    por_rota: dict[str, list] = {}
-
-    for origem, destino, data_partida in datas:
-        if date.fromisoformat(data_partida) <= date.today():
-            continue
-
-        rota_config    = next((r for r in ROTAS if r["origem"] == origem
-                               and r["destino"] == destino), None)
-        trip_class     = _CABINE_MAP.get(
-            rota_config.get("cabine", "economy") if rota_config else "economy", 0)
-        somente_direto = rota_config.get("somente_direto", False) if rota_config else False
-        ida_e_volta    = rota_config.get("ida_e_volta",    True)  if rota_config else True
-        dias_retorno   = rota_config.get("dias_retorno",   7)     if rota_config else 7
-        log.info("  Consultando %s → %s | %s…", origem, destino, data_partida)
-        voo = _buscar_preco_data(origem, destino, data_partida, trip_class,
-                                 somente_direto, ida_e_volta, dias_retorno)
-        if voo is None:
-            log.info("  Sem preço disponível para %s → %s | %s.", origem, destino, data_partida)
-            continue
-
-        salvar_preco(origem, destino, data_partida, voo["preco"], voo["companhia"], "real")
-        log.info("  %s → %s | %s | USD %.2f | %s (real)",
-                 origem, destino, data_partida, voo["preco"], voo["companhia"])
-
-        chave = f"{origem}→{destino}"
-        por_rota.setdefault(chave, []).append({
-            "data":      data_partida,
-            "preco":     voo["preco"],
-            "companhia": voo["companhia"],
-            "alerta":    voo["preco"] < alertas.get((origem, destino), float("inf")),
-        })
-        time.sleep(PAUSA_CHAMADAS)
-
-    if not por_rota:
-        log.info("Sem resultados para enviar ao Telegram.")
-        return
-
-    linhas = [f"✈️ <b>Monitoramento — {agora}</b>\n"]
-    for rota, voos in por_rota.items():
-        linhas.append(f"<b>{rota}</b>")
-        for v in sorted(voos, key=lambda x: x["preco"]):
-            icone = "🔴" if v["alerta"] else "🔵"
-            linhas.append(f"{icone} {v['data']}  |  USD {v['preco']:.2f}  |  {v['companhia']}")
+        linhas.append(f"<b>{origem} → {destino}</b>")
+        for v in top:
+            salvar_preco(origem, destino, v["mes"], v["preco_brl"],
+                         v["companhia"], v["paradas"])
+            icone   = "🔴" if v["preco_brl"] < alerta_brl else "🔵"
+            paradas = "direto" if v["paradas"] == 0 else f"{v['paradas']} parada(s)"
+            link    = v["link"]
+            linhas.append(
+                f'{icone} {v["mes"]}  |  R$ {v["preco_brl"]:,.0f}  |  '
+                f'{v["companhia"]} ({paradas})  '
+                f'<a href="{link}">🛒 comprar</a>'
+            )
+            log.info("%s → %s | %s | R$ %.2f | %s (%d paradas)",
+                     origem, destino, v["mes"], v["preco_brl"],
+                     v["companhia"], v["paradas"])
         linhas.append("")
+        encontrou = True
 
-    linhas.append("🔴 = abaixo do limite de alerta")
-    enviar_telegram("\n".join(linhas))
-    log.info("--- Monitoramento horário concluído ---")
+    if encontrou:
+        linhas.append("🔴 = abaixo do limite de alerta")
+        enviar_telegram("\n".join(linhas))
+    else:
+        log.info("Sem resultados para enviar ao Telegram.")
+
+    log.info("=== Verificação concluída ===")
 
 # ---------------------------------------------------------------------------
 # MAIN
@@ -365,16 +332,14 @@ def monitoramento_horario():
 def main():
     init_db()
 
-    log.info("Iniciando monitor — primeira varredura agora.")
-    varredura_diaria()
-    monitoramento_horario()
+    log.info("Iniciando monitor — primeira verificação agora.")
+    verificar_rotas()
 
     scheduler = BackgroundScheduler(timezone="America/Sao_Paulo")
-    scheduler.add_job(varredura_diaria,      "cron", hour=7,   minute=0,  id="varredura_diaria")
-    scheduler.add_job(monitoramento_horario, "cron", minute=5,             id="monitoramento_horario")
+    scheduler.add_job(verificar_rotas, "interval", hours=6, id="verificar_rotas")
 
     scheduler.start()
-    log.info("Agendador iniciado. Pressione Ctrl+C para encerrar.")
+    log.info("Agendador iniciado (a cada 6h). Pressione Ctrl+C para encerrar.")
     try:
         while True:
             time.sleep(1)
